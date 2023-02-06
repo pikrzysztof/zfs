@@ -38,6 +38,11 @@
 
 #define	MAXBUF	4096
 
+int
+strstr_fd(int fd, const char *const needle);
+int
+actually_faulted(const char *const class);
+
 /*
  * Open the libzfs interface.
  */
@@ -907,6 +912,119 @@ _zed_event_add_time_strings(uint64_t eid, zed_strings_t *zsp, int64_t etime[])
 	}
 }
 
+
+/*
+ * Reads from fd until an EOF and tell whether a string was found fd's
+ * output.
+ * Returns 1 if needle was found, 0 if not, -1 for errors.
+ */
+int
+strstr_fd(int haystack_fd, const char *const needle)
+{
+	char buf[MAXBUF];
+
+	int buf_start = 0;
+	for (int i = 0; i < 30; ++i) {
+		int rv = read(haystack_fd, buf + buf_start, MAXBUF - buf_start);
+		if (rv == -1) {
+			switch (errno) {
+			case EWOULDBLOCK:
+			case EINTR:
+				continue;
+			default:
+				zed_log_msg(LOG_WARNING,
+				    "Could not read from pipe, bailing: %s",
+				    strerror(errno));
+				return (-1);
+			}
+		}
+
+		if (rv > 0) {
+			buf_start += rv;
+		}
+		if (rv == 0 || buf_start == MAXBUF) {
+			if (buf_start == MAXBUF) {
+				buf[MAXBUF - 1] = '\0';
+			} else {
+				buf[buf_start] = '\0';
+			}
+			break;
+
+		}
+		sleep(1);
+	}
+	return (strstr(buf, needle) != NULL);
+}
+
+
+/* Sleeps for a while to give time for the the drive to recover  */
+int
+actually_faulted(const char *const class)
+{
+	char GLITCHY_CLASS[] = "ereport.fs.zfs.vdev.unknown";
+	if (strncmp(GLITCHY_CLASS, class, sizeof (GLITCHY_CLASS)) != 0) {
+		return (1);
+	}
+	int pipes[2];
+	if (!pipe2(pipes, 0)) {
+		zed_log_msg(LOG_WARNING,
+		    "Could not create pipes to call zpool status: %s",
+		    strerror(errno));
+		return (1);
+	}
+	pid_t child = fork();
+	int retval = 1;
+	if (child == -1) {
+		zed_log_msg(LOG_WARNING,
+		    "Could not fork() to call zpool status: %s",
+		    strerror(errno));
+
+		goto cleanup;
+	}
+	if (child == 0) {
+		if (dup2(1, pipes[1])) {
+			zed_log_msg(LOG_WARNING,
+			    "Could not dup2() to communicate with "
+			    "zpool status: %s",
+			    strerror(errno));
+			return (1);
+		}
+		char *const zpoolopts[] = {"list", "-H"};
+		char *const zpoolenv[] = {NULL};
+		execve("/sbin/zpool", zpoolopts, zpoolenv);
+		zed_log_msg(LOG_WARNING,
+		    "Could not execve zpool status: %s", strerror(errno));
+		return (1);
+	}
+	if (fcntl(pipes[0], F_SETFD, O_NONBLOCK)) {
+		zed_log_msg(LOG_WARNING,
+		    "Could not set read pipe to nonblocking, bailing: %s",
+		    strerror(errno));
+		goto cleanup;
+	}
+	sleep(5);  // give drive some time to unglitch itself
+	if (strstr_fd(pipes[0], "ONLINE") == 1) {
+		retval = 0;
+		goto cleanup;
+	} else {
+		retval = 1;
+		goto cleanup;
+	}
+
+cleanup:
+	for (unsigned int i = 0; i < 2; ++i) {
+		if (close(pipes[i])) {
+			zed_log_msg(LOG_WARNING,
+			    "Could not close %s fd %d used to communicate"
+			    " with zpool status: %s",
+			    i == 0 ? "read" : "write", pipes[i],
+			    strerror(errno));
+		}
+	}
+	return (retval);
+
+}
+
 /*
  * Service the next zevent, blocking until one is available.
  */
@@ -953,6 +1071,10 @@ zed_event_service(struct zed_conf *zcp)
 	} else if (nvlist_lookup_string(nvl, "class", &class) != 0) {
 		zed_log_msg(LOG_WARNING,
 		    "Failed to lookup zevent class (eid=%llu)", eid);
+	} else if (!actually_faulted(class)) {
+		zed_log_msg(LOG_WARNING,
+		    "Zpool glitched just for a moment, "
+		    "ignoring event (eid=%llu)", eid);
 	} else {
 		/* let internal modules see this event first */
 		zfs_agent_post_event(class, NULL, nvl);
