@@ -35,6 +35,7 @@
  * marking the vdev FAULTY (for I/O errors) or DEGRADED (for checksum errors).
  */
 
+#include <fcntl.h>
 #include <sys/fs/zfs.h>
 #include <sys/fm/protocol.h>
 #include <sys/fm/fs/zfs.h>
@@ -177,6 +178,91 @@ find_by_guid(libzfs_handle_t *zhdl, uint64_t pool_guid, uint64_t vdev_guid,
 }
 
 /*
+ * Reads from fd until an EOF and tell whether a string was found fd's
+ * output.
+ * Returns 1 if needle was found, 0 if not, -1 for errors.
+ */
+static int
+strstr_fd(int haystack_fd, const char *const needle)
+{
+	const int MAXBUF = 4096;
+	char buf[MAXBUF];
+
+	int buf_start = 0;
+	for (int i = 0; i < 30; ++i) {
+		int rv = read(haystack_fd, buf + buf_start, MAXBUF - buf_start);
+		if (rv == -1) {
+			switch (errno) {
+			case EWOULDBLOCK:
+			case EINTR:
+				continue;
+			default:
+				return (-1);
+			}
+		}
+
+		if (rv > 0) {
+			buf_start += rv;
+		}
+		if (rv == 0 || buf_start == MAXBUF) {
+			if (buf_start == MAXBUF) {
+				buf[MAXBUF - 1] = '\0';
+			} else {
+				buf[buf_start] = '\0';
+			}
+			break;
+
+		}
+		sleep(1);
+	}
+	return (strstr(buf, needle) != NULL);
+}
+
+
+/* Sleeps for a while to give time for the the drive to recover  */
+static int
+actually_faulted()
+{
+	int pipes[2];
+	if (!pipe2(pipes, 0)) {
+		return (1);
+	}
+	pid_t child = fork();
+	int retval = 1;
+	if (child == -1) {
+		goto cleanup;
+	}
+	if (child == 0) {
+		if (dup2(1, pipes[1])) {
+			return (1);
+		}
+		char *const zpoolopts[] = {"list", "-H"};
+		char *const zpoolenv[] = {NULL};
+		execve("/sbin/zpool", zpoolopts, zpoolenv);
+		return (1);
+	}
+	if (fcntl(pipes[0], F_SETFD, O_NONBLOCK)) {
+		goto cleanup;
+	}
+	sleep(5);  // give drive some time to unglitch itself
+	if (strstr_fd(pipes[0], "ONLINE") == 1) {
+		retval = 0;
+		goto cleanup;
+	} else {
+		retval = 1;
+		goto cleanup;
+	}
+
+cleanup:
+	for (unsigned int i = 0; i < 2; ++i) {
+		close(pipes[i]);
+	}
+	return (retval);
+
+}
+
+
+/*
  * Given a vdev, attempt to replace it with every known spare until one
  * succeeds or we run out of devices to try.
  * Return whether we were successful or not in replacing the device.
@@ -191,6 +277,7 @@ replace_with_spare(fmd_hdl_t *hdl, zpool_handle_t *zhp, nvlist_t *vdev)
 	zprop_source_t source;
 	int ashift;
 
+
 	config = zpool_get_config(zhp, NULL);
 	if (nvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE,
 	    &nvroot) != 0)
@@ -201,6 +288,10 @@ replace_with_spare(fmd_hdl_t *hdl, zpool_handle_t *zhp, nvlist_t *vdev)
 	 */
 	if (nvlist_lookup_nvlist_array(nvroot, ZPOOL_CONFIG_SPARES,
 	    &spares, &nspares) != 0)
+		return (B_FALSE);
+
+
+	if (!actually_faulted())
 		return (B_FALSE);
 
 	/*
